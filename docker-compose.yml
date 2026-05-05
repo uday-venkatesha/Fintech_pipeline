@@ -1,0 +1,200 @@
+version: "3.9"
+
+# ─────────────────────────────────────────────
+#  Fintech Batch Pipeline — Local Dev Stack
+#  Services: postgres-source, airflow (webserver
+#            scheduler, worker, triggerer), redis
+# ─────────────────────────────────────────────
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.9.2-python3.12
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: CeleryExecutor
+    AIRFLOW__CORE__FERNET_KEY: "81HqDtbqAywKSOumSha3BhWNOdQ26slT6K0YaZeZyPs="
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "false"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DEFAULT_TIMEZONE: "UTC"
+
+    # Metadata DB — Airflow's own internal state
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres-meta/airflow
+
+    # Celery broker + backend
+    AIRFLOW__CELERY__BROKER_URL: redis://redis:6379/0
+    AIRFLOW__CELERY__RESULT_BACKEND: db+postgresql://airflow:airflow@postgres-meta/airflow
+
+    # Our source DB connection (used inside DAGs)
+    SOURCE_DB_CONN: postgresql://pipeline:pipeline@postgres-source:5432/transactions_db
+
+    # Webserver
+    AIRFLOW__WEBSERVER__EXPOSE_CONFIG: "true"
+    AIRFLOW__WEBSERVER__SECRET_KEY: "local-dev-secret-key-change-in-prod"
+
+    # Logging
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    AIRFLOW__LOGGING__COLORED_CONSOLE_LOG: "true"
+
+    # ── pip packages installed at container startup ──
+    _PIP_ADDITIONAL_REQUIREMENTS: >-
+      psycopg[binary]==3.1.19
+      duckdb==0.10.3
+      great-expectations==0.18.15
+      pandas==2.2.2
+      pyarrow==16.1.0
+      pendulum==3.0.0
+      prometheus-client==0.20.0
+
+  volumes:
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+    - ./warehouse:/opt/airflow/warehouse       # DuckDB files live here
+    - ./scripts:/opt/airflow/scripts
+  depends_on:
+    postgres-meta:
+      condition: service_healthy
+    redis:
+      condition: service_healthy
+  networks:
+    - pipeline-net
+
+services:
+
+  # ── Source Database ──────────────────────────
+  # This is the "application DB" our generator writes to.
+  # Simulates a live production Postgres instance.
+  postgres-source:
+    image: postgres:16-alpine
+    container_name: postgres-source
+    environment:
+      POSTGRES_USER: pipeline
+      POSTGRES_PASSWORD: pipeline
+      POSTGRES_DB: transactions_db
+    ports:
+      - "5433:5432"           # 5433 on host to avoid clash with local postgres
+    volumes:
+      - postgres_source_data:/var/lib/postgresql/data
+      - ./scripts/init_source_db.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pipeline -d transactions_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pipeline-net
+
+  # ── Airflow Metadata DB ──────────────────────
+  # Separate postgres for Airflow's internal state.
+  # Never mix this with your source/warehouse DBs.
+  postgres-meta:
+    image: postgres:16-alpine
+    container_name: postgres-meta
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes:
+      - postgres_meta_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U airflow"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks:
+      - pipeline-net
+
+  # ── Redis (Celery broker) ────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - pipeline-net
+
+  # ── Airflow Init ─────────────────────────────
+  # One-shot container: initialises DB, creates admin user, then exits.
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username admin \
+          --password admin \
+          --firstname Dev \
+          --lastname User \
+          --role Admin \
+          --email admin@local.dev
+        echo "Airflow initialised ✓"
+    restart: "no"
+
+  # ── Airflow Webserver ────────────────────────
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+    restart: unless-stopped
+
+  # ── Airflow Scheduler ────────────────────────
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: unless-stopped
+
+  # ── Airflow Worker ───────────────────────────
+  airflow-worker:
+    <<: *airflow-common
+    container_name: airflow-worker
+    command: celery worker
+    restart: unless-stopped
+
+  # ── Airflow Triggerer ────────────────────────
+  # Required for deferrable operators (async tasks).
+  airflow-triggerer:
+    <<: *airflow-common
+    container_name: airflow-triggerer
+    command: triggerer
+    restart: unless-stopped
+
+  # ── Transaction Generator ────────────────────
+  # Continuously inserts synthetic transactions
+  # into postgres-source. Runs as a standalone service.
+  generator:
+    image: python:3.12-slim
+    container_name: tx-generator
+    environment:
+      SOURCE_DB_CONN: postgresql://pipeline:pipeline@postgres-source:5432/transactions_db
+    volumes:
+      - ./generator:/app
+    working_dir: /app
+    command: >
+      bash -c "pip install psycopg[binary]==3.1.19 faker==24.11.0 --quiet
+               && python generate_transactions.py"
+    depends_on:
+      postgres-source:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - pipeline-net
+
+volumes:
+  postgres_source_data:
+  postgres_meta_data:
+
+networks:
+  pipeline-net:
+    driver: bridge
