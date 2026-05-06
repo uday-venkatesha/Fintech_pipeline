@@ -1,0 +1,34 @@
+# Python / Virtual Environment
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+env/
+.env
+
+# MacOS
+.DS_Store
+
+# IDE / Editors
+.vscode/
+.idea/
+*.swp
+
+# Airflow
+airflow/logs/
+airflow/airflow.cfg
+airflow/airflow.db
+airflow/webserver_config.py
+
+# Data files and Warehouse (assuming duckdb/parquet files are stored here)
+warehouse/*
+!warehouse/.gitkeep
+*.csv
+*.parquet
+*.duckdb
+*.db
+
+# Other logs
+logs/
+*.log

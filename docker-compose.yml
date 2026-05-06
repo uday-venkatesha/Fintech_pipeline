@@ -182,8 +182,7 @@ services:
       - ./generator:/app
     working_dir: /app
     command: >
-      bash -c "pip install psycopg[binary]==3.1.19 faker==24.11.0 --quiet
-               && python generate_transactions.py"
+      bash -c "pip install psycopg[binary]==3.1.19 faker==24.11.0 --quiet && python generate_transactions.py"
     depends_on:
       postgres-source:
         condition: service_healthy
